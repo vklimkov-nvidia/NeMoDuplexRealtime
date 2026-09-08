@@ -631,6 +631,13 @@ class Transformer(torch.nn.Module):
         for layer in self.layers:
             layer.reset_cache(use_cache)
 
+    def cache_sequence_length(self) -> int:
+        """Return the number of cached self-attention positions."""
+        if not self.layers:
+            return 0
+        self_k = self.layers[0].self_attention.cache['self_k']
+        return 0 if self_k is None else self_k.size(1)
+
     @staticmethod
     def _init_weights_gpt2(module):
         if isinstance(module, (torch.nn.Linear, torch.nn.Embedding, torch.nn.Conv1d)):

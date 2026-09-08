@@ -39,6 +39,7 @@ from nemo.collections.tts.models.easy_magpietts_inference import EasyMagpieTTSIn
 from nemo.collections.tts.modules.magpietts_modules import (
     LocalTransformerType,
     add_special_tokens,
+    remove_embedded_eos_token,
     remove_eos_token,
     remove_special_tokens,
     worker_init_fn,
@@ -73,6 +74,8 @@ class ProcessBatchOutput:
     Attributes:
         loss: Total combined loss (codebook_loss + phoneme_loss + local_transformer_loss)
         codebook_loss: Cross-entropy loss for parallel audio codebook prediction
+        acoustic_codebook_loss: Loss from cumulative acoustic refinement
+        pred_audio_codes: Semantic-backbone plus refined-acoustic predictions
         phoneme_loss: Cross-entropy loss for phoneme prediction (None if no phoneme tokenizer)
         local_transformer_loss: Loss from local transformer (None if not used)
         local_transformer_logits: Logits from local transformer (None if not used)
@@ -89,6 +92,8 @@ class ProcessBatchOutput:
 
     loss: torch.Tensor
     codebook_loss: torch.Tensor
+    acoustic_codebook_loss: Optional[torch.Tensor]
+    pred_audio_codes: Optional[torch.Tensor]
     phoneme_loss: Optional[torch.Tensor]
     local_transformer_loss: Optional[torch.Tensor]
     local_transformer_logits: Optional[torch.Tensor]
@@ -124,6 +129,7 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
         self.phoneme_loss_weight = cfg.get('phoneme_loss_weight', 1.0)
         self.parallel_codebook_loss_scale = cfg.get('parallel_codebook_loss_scale', 1.0)
         self.local_transformer_loss_scale = cfg.get('local_transformer_loss_scale', 1.0)
+        self.val_temp = cfg.get('val_temp', 0.7)
 
         self.cross_entropy_loss = nn.CrossEntropyLoss(reduction='none')
 
@@ -306,14 +312,16 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
         audio_codes_lens_target,
         context_audio_codes=None,
         context_audio_codes_lens=None,
+        pred_audio_codes=None,
     ):
         wandb_audio_log = {}
 
-        pred_audio_codes = self.logits_to_audio_codes(logits, audio_codes_lens_target)
-        pred_audio_codes, _ = remove_eos_token(
-            codes=pred_audio_codes,
-            codes_len=audio_codes_lens_target,
-        )
+        if pred_audio_codes is None:
+            pred_audio_codes = self.logits_to_audio_codes(logits, audio_codes_lens_target)
+            pred_audio_codes, _ = remove_eos_token(
+                codes=pred_audio_codes,
+                codes_len=audio_codes_lens_target,
+            )
         pred_audio_codes, pred_audio_codes_lens = self._prepare_codes_for_decode(
             pred_audio_codes, audio_codes_lens_target - 1
         )
@@ -815,7 +823,9 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
                 )
 
         # Embed audio tokens
-        audio_embedded = self.embed_audio_tokens(audio_codes_input)  # (B, T'-1, E)
+        audio_embedded = self.embed_audio_tokens(
+            audio_codes_input, audio_codes_lens_target, dropout_codes=self.training
+        )  # (B, T'-1, E)
 
         # Create zero tensor for delay padding
         max_delay = delay.max().item()
@@ -1207,6 +1217,40 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
         )
         loss = self.parallel_codebook_loss_scale * codebook_loss
 
+        acoustic_codebook_loss = None
+        pred_audio_codes = None
+        if self.acoustic_decoder_transformer is not None:
+            acoustic_inputs, acoustic_lens = remove_embedded_eos_token(
+                embedded=pred_embeddings,
+                embedded_len=audio_codes_lens_target,
+            )
+            refinement_targets, refinement_lens = remove_eos_token(
+                codes=audio_codes_target,
+                codes_len=audio_codes_lens_target,
+            )
+            if not torch.equal(acoustic_lens, refinement_lens):
+                raise RuntimeError("Backbone embeddings and acoustic targets are not time-aligned")
+
+            acoustic_loss_mask = agent_mask if self.cfg.get("mask_user_on_loss", False) else None
+            if acoustic_loss_mask is not None:
+                acoustic_loss_mask = acoustic_loss_mask[:, : acoustic_inputs.size(1)]
+            pred_acoustic_codes, _, acoustic_codebook_loss = self.acoustic_decoder_transformer(
+                inputs=acoustic_inputs,
+                audio_lens=acoustic_lens,
+                semantic_tokens=audio_codes[:, :1],
+                vector_quantizer=self._codec_model.vector_quantizer,
+                acoustic_tokens=refinement_targets[:, 1:],
+                loss_mask=acoustic_loss_mask,
+            )
+            loss = loss + acoustic_codebook_loss
+
+            parallel_predictions = self.logits_to_audio_codes(logits, audio_codes_lens_target)
+            parallel_predictions, _ = remove_eos_token(
+                codes=parallel_predictions,
+                codes_len=audio_codes_lens_target,
+            )
+            pred_audio_codes = torch.cat([parallel_predictions[:, :1], pred_acoustic_codes], dim=1)
+
         # Compute local transformer loss if applicable
         local_transformer_loss = None
         local_transformer_logits = None
@@ -1263,6 +1307,8 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
         return ProcessBatchOutput(
             loss=loss,
             codebook_loss=codebook_loss,
+            acoustic_codebook_loss=acoustic_codebook_loss,
+            pred_audio_codes=pred_audio_codes,
             phoneme_loss=phoneme_loss,
             local_transformer_loss=local_transformer_loss,
             local_transformer_logits=local_transformer_logits,
@@ -1379,7 +1425,7 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
                 self.num_audio_codebooks,
             )
 
-            user_audio_embedded = self.embed_audio_tokens(user_audio_codes)
+            user_audio_embedded = self.embed_audio_tokens(user_audio_codes, user_audio_codes_lens, for_context=True)
 
             B = batch["text"].shape[0]
             T = batch["text"].shape[1]
@@ -1505,6 +1551,10 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
         self.log('train/codebook_loss', codebook_loss, prog_bar=True, sync_dist=True)
         self.log('train/loss', loss, prog_bar=True, sync_dist=True)
 
+        acoustic_codebook_loss = batch_output.acoustic_codebook_loss
+        if acoustic_codebook_loss is not None:
+            self.log('train/acoustic_codebook_loss', acoustic_codebook_loss, prog_bar=True, sync_dist=True)
+
         if self.phoneme_tokenizer is not None:
             phoneme_loss = batch_output.phoneme_loss
             self.log('train/phoneme_loss', phoneme_loss, prog_bar=True, sync_dist=True)
@@ -1604,6 +1654,8 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
         # If using local_transformer, local_transformer_logits are also available
         loss = batch_output.loss
         codebook_loss = batch_output.codebook_loss
+        acoustic_codebook_loss = batch_output.acoustic_codebook_loss
+        pred_audio_codes = batch_output.pred_audio_codes
         logits = batch_output.logits
         audio_codes_target = batch_output.audio_codes_target
         audio_codes_lens_target = batch_output.audio_codes_lens_target
@@ -1617,7 +1669,12 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
             # Get audio data for logging
             wandb_log_dict.update(
                 self.log_val_audio_example(
-                    logits, audio_codes_target, audio_codes_lens_target, context_audio_codes, context_audio_codes_lens
+                    logits,
+                    audio_codes_target,
+                    audio_codes_lens_target,
+                    context_audio_codes,
+                    context_audio_codes_lens,
+                    pred_audio_codes=pred_audio_codes,
                 )
             )
 
@@ -1632,6 +1689,8 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
             'val_codebook_loss': codebook_loss,
             'val_local_transformer_loss': local_transformer_loss,
         }
+        if acoustic_codebook_loss is not None:
+            val_output['val_acoustic_codebook_loss'] = acoustic_codebook_loss
 
         if self.phoneme_tokenizer is not None:
             phoneme_loss = batch_output.phoneme_loss
@@ -1642,7 +1701,7 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
             infer_output = self.infer_batch(
                 batch,
                 max_decoder_steps=330,
-                temperature=0.7,
+                temperature=self.val_temp,
                 topk=80,
                 use_local_transformer_for_inference=self.local_transformer_type == LocalTransformerType.AR,
                 use_cfg=self.cfg.get('inference_use_cfg_in_val', True),
@@ -1869,6 +1928,10 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
 
         self.log("val_loss", val_loss, prog_bar=True, sync_dist=True)
         self.log("val/codebook_loss", val_codebook_loss, prog_bar=True, sync_dist=True)
+
+        if self.acoustic_decoder_transformer is not None:
+            val_acoustic_codebook_loss = collect("val_acoustic_codebook_loss")
+            self.log("val/acoustic_codebook_loss", val_acoustic_codebook_loss, prog_bar=True, sync_dist=True)
 
         if self.local_transformer_type != LocalTransformerType.NO_LT:
             val_local_transformer_loss = collect("val_local_transformer_loss")
